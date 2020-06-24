@@ -99,9 +99,13 @@ def verify_s3_object_version(s3, s3_object):
             "Object versioning is not enabled in bucket %s" % s3_object.bucket_name
         )
 
+def remove_prefix(text, prefix):
+    if text.startswith(prefix):
+        return text[len(prefix):]
+    return text
 
 def get_local_path(s3_object, local_prefix):
-    return os.path.join(local_prefix, s3_object.bucket_name, s3_object.key)
+    return os.path.join(local_prefix, s3_object.bucket_name, remove_prefix(s3_object.key, "/"))
 
 
 def delete_s3_object(s3_object):
@@ -203,9 +207,8 @@ def decrypt_kms_data_key(kms_client, data_key):
     if data_key == None:
         return None
     binary_data = base64.b64decode(data_key)
-    meta = kms_client.decrypt(CiphertextBlob=binary_data)
-    plaintext = meta[u'Plaintext']
-    return plaintext.decode()
+    response = kms_client.decrypt(CiphertextBlob=binary_data)
+    return response[u'Plaintext']
 
 def lambda_handler(event, context):
     s3 = boto3.resource("s3")
@@ -235,7 +238,8 @@ def lambda_handler(event, context):
     create_dir(os.path.dirname(file_path))
     extra_args_for_download = None
     if sse_customer_plain_text_key != None:
-        extra_args_for_download = {'SSECustomerKey': sse_customer_plain_text_key}
+        extra_args_for_download = {'SSECustomerKey': sse_customer_plain_text_key, 'SSECustomerAlgorithm': 'AES256'}
+
     s3_object.download_file(file_path, ExtraArgs=extra_args_for_download)
 
     to_download = clamav.update_defs_from_s3(
