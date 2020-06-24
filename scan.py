@@ -15,6 +15,7 @@
 
 import copy
 import json
+import base64
 import os
 from urllib.parse import unquote_plus
 from distutils.util import strtobool
@@ -64,6 +65,7 @@ def event_object(event, event_source="s3"):
     if "object" not in s3_obj:
         raise Exception("No key found in event!")
     key_name = s3_obj["object"].get("key", None)
+    sse_customer_key = s3_obj["object"].get("sseCustomerKey", None)
 
     if key_name:
         key_name = unquote_plus(key_name)
@@ -74,7 +76,7 @@ def event_object(event, event_source="s3"):
 
     # Create and return the object
     s3 = boto3.resource("s3")
-    return s3.Object(bucket_name, key_name)
+    return {"s3_object": s3.Object(bucket_name, key_name), "sse_customer_key": sse_customer_key}
 
 
 def verify_s3_object_version(s3, s3_object):
@@ -197,11 +199,19 @@ def sns_scan_results(
         },
     )
 
+def decrypt_kms_data_key(kms_client, data_key):
+    if data_key == None:
+        return None
+    binary_data = base64.b64decode(data_key)
+    meta = kms_client.decrypt(CiphertextBlob=binary_data)
+    plaintext = meta[u'Plaintext']
+    return plaintext.decode()
 
 def lambda_handler(event, context):
     s3 = boto3.resource("s3")
     s3_client = boto3.client("s3")
     sns_client = boto3.client("sns")
+    kms_client = boto3.client("kms")
 
     # Get some environment variables
     ENV = os.getenv("ENV", "")
@@ -209,7 +219,9 @@ def lambda_handler(event, context):
 
     start_time = get_timestamp()
     print("Script starting at %s\n" % (start_time))
-    s3_object = event_object(event, event_source=EVENT_SOURCE)
+    event_details = event_object(event, event_source=EVENT_SOURCE)
+    s3_object = event_details['s3_object']
+    sse_customer_plain_text_key = decrypt_kms_data_key(kms_client, event_details['sse_customer_key'])
 
     if str_to_bool(AV_PROCESS_ORIGINAL_VERSION_ONLY):
         verify_s3_object_version(s3, s3_object)
@@ -221,7 +233,10 @@ def lambda_handler(event, context):
 
     file_path = get_local_path(s3_object, "/tmp")
     create_dir(os.path.dirname(file_path))
-    s3_object.download_file(file_path)
+    extra_args_for_download = None
+    if sse_customer_plain_text_key != None:
+        extra_args_for_download = {'SSECustomerKey': sse_customer_plain_text_key}
+    s3_object.download_file(file_path, ExtraArgs=extra_args_for_download)
 
     to_download = clamav.update_defs_from_s3(
         s3_client, AV_DEFINITION_S3_BUCKET, AV_DEFINITION_S3_PREFIX
@@ -268,7 +283,7 @@ def lambda_handler(event, context):
         delete_s3_object(s3_object)
     stop_scan_time = get_timestamp()
     print("Script finished at %s\n" % stop_scan_time)
-
+    return scan_result
 
 def str_to_bool(s):
     return bool(strtobool(str(s)))
